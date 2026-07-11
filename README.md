@@ -7,7 +7,9 @@ Photo Culling CLI is a non-destructive Python command-line tool for AI-assisted 
 - Never modifies RAW files
 - Never deletes RAW files
 - Never moves RAW files
-- Only writes the output JSONL file and temporary preview JPEG files
+- Rejects RAW files, including symlinks to RAW files, as `--output` targets
+- Validates that `--output` is an appendable file before processing begins
+- Only writes the validated output JSONL file and temporary preview JPEG files
 - Removes temporary preview files even when processing fails
 
 ## Requirements
@@ -144,3 +146,16 @@ Error records keep the failure message, and invalid model JSON also preserves th
 - `--resume` treats any existing `raw_path` in the output file as completed, even if the earlier record contains an error.
 - Invalid JSONL lines in resume mode stop startup with a clear error so you can repair the file intentionally.
 - Model output must be strict JSON with `rating`, `keep`, and `reason`.
+- The tool tries ExifTool's `PreviewImage` first, then falls back to `JpgFromRaw` when needed. Each extraction has a 60-second timeout.
+- Symlink aliases to the same RAW file are processed only once.
+
+## Run Tests
+
+Install development dependencies, then run the full deterministic test suite:
+
+```bash
+python -m pip install -e .[dev]
+python -m pytest
+```
+
+The tests mock ExifTool and Ollama, so they do not require a running Ollama server, a local model, or installed ExifTool.
