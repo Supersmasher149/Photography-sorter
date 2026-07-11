@@ -51,6 +51,17 @@ class CoreJsonlTests(unittest.TestCase):
                 {"/photos/IMG_0001.CR3", "/photos/IMG_0002.CR3"},
             )
 
+    def test_load_completed_paths_rejects_non_object_with_line_number(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_path = Path(tmp) / "ratings.jsonl"
+            output_path.write_text("[]\n", encoding="utf-8")
+
+            with self.assertRaises(ValueError) as exc:
+                load_completed_paths(output_path)
+
+            self.assertIn("line 1", str(exc.exception))
+            self.assertIn("expected object", str(exc.exception))
+
     def test_parse_model_json_validates_required_fields(self):
         parsed = parse_model_json(
             '{"rating": 4, "keep": true, "reason": "Strong composition."}'

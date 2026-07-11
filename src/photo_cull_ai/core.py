@@ -26,6 +26,8 @@ OLLAMA_PROMPT = (
     '"reason":"short explanation"}'
 )
 
+EXIFTOOL_TIMEOUT_SECONDS = 60
+
 
 class PreviewExtractionError(RuntimeError):
     """Raised when a RAW file has no usable embedded JPEG preview."""
@@ -34,11 +36,11 @@ class PreviewExtractionError(RuntimeError):
 def find_raw_files(input_dir: Path, recursive: bool = False) -> list[Path]:
     path = Path(input_dir)
     iterator = path.rglob("*") if recursive else path.iterdir()
-    raw_files = [
+    raw_files = {
         candidate.resolve()
         for candidate in iterator
         if candidate.is_file() and candidate.suffix.lower() in SUPPORTED_RAW_EXTENSIONS
-    ]
+    }
     return sorted(raw_files, key=lambda item: str(item).lower())
 
 
@@ -59,6 +61,10 @@ def load_completed_paths(output_path: Path) -> set[str]:
                 raise ValueError(
                     f"Invalid JSONL in {path} on line {line_number}: {exc.msg}"
                 ) from exc
+            if not isinstance(record, dict):
+                raise ValueError(
+                    f"Invalid JSONL in {path} on line {line_number}: expected object"
+                )
             raw_path = record.get("raw_path")
             if not isinstance(raw_path, str) or not raw_path:
                 raise ValueError(
@@ -106,6 +112,7 @@ def extract_embedded_jpeg(
     fd, temp_name = tempfile.mkstemp(suffix=".jpg")
     os.close(fd)
     temp_path = Path(temp_name)
+    failures: list[str] = []
 
     try:
         for tag in ("PreviewImage", "JpgFromRaw"):
@@ -113,13 +120,12 @@ def extract_embedded_jpeg(
                 ["exiftool", f"-{tag}", "-b", str(raw_path)],
                 check=False,
                 capture_output=True,
+                timeout=EXIFTOOL_TIMEOUT_SECONDS,
             )
             if result.returncode != 0:
                 stderr_text = result.stderr.decode("utf-8", errors="replace").strip()
                 if stderr_text:
-                    raise PreviewExtractionError(
-                        f"exiftool failed for {raw_path.name}: {stderr_text}"
-                    )
+                    failures.append(f"{tag}: {stderr_text}")
                 continue
             data = result.stdout
             if data:
@@ -132,20 +138,30 @@ def extract_embedded_jpeg(
 
     if temp_path.exists():
         temp_path.unlink()
+    if failures:
+        raise PreviewExtractionError(
+            f"exiftool failed for {raw_path.name}: {'; '.join(failures)}"
+        )
     raise PreviewExtractionError("No embedded JPEG preview found.")
 
 
 def resize_to_temp_jpeg(preview_path: Path, max_size: int) -> Path:
     from PIL import Image, ImageOps
 
-    output_path = Path(tempfile.NamedTemporaryFile(suffix=".jpg", delete=False).name)
-    with Image.open(preview_path) as image:
-        oriented = ImageOps.exif_transpose(image)
-        if oriented.mode != "RGB":
-            oriented = oriented.convert("RGB")
-        oriented.thumbnail((max_size, max_size))
-        oriented.save(output_path, format="JPEG", quality=88)
-    return output_path
+    fd, temp_name = tempfile.mkstemp(suffix=".jpg")
+    os.close(fd)
+    output_path = Path(temp_name)
+    try:
+        with Image.open(preview_path) as image:
+            oriented = ImageOps.exif_transpose(image)
+            if oriented.mode != "RGB":
+                oriented = oriented.convert("RGB")
+            oriented.thumbnail((max_size, max_size))
+            oriented.save(output_path, format="JPEG", quality=88)
+        return output_path
+    except Exception:
+        output_path.unlink(missing_ok=True)
+        raise
 
 
 def grade_with_ollama(image_path: Path, model: str, client: Any | None = None) -> str:
@@ -195,6 +211,7 @@ def process_raw_file(
     resized_path: Path | None = None
     raw_response: str | None = None
     record: dict[str, Any]
+    cleanup_errors: list[str] = []
 
     try:
         preview_path = extract_preview(raw_path)
@@ -211,8 +228,24 @@ def process_raw_file(
         )
     finally:
         for temp_path in (preview_path, resized_path):
-            if temp_path is not None and temp_path.exists():
-                temp_path.unlink()
+            if temp_path is None:
+                continue
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError as exc:
+                cleanup_errors.append(f"Failed to remove temporary file {temp_path}: {exc}")
+
+    if cleanup_errors:
+        cleanup_error = "; ".join(cleanup_errors)
+        if record["error"]:
+            record["error"] = f"{record['error']}; {cleanup_error}"
+        else:
+            record = build_error_record(
+                raw_path=raw_path,
+                model=model,
+                error=cleanup_error,
+                raw_response=raw_response,
+            )
 
     append_jsonl(output_path, record)
     return record
@@ -310,6 +343,12 @@ def validate_startup(
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
+    resolved_output = output_path.resolve()
+    if resolved_output.suffix.lower() in SUPPORTED_RAW_EXTENSIONS:
+        raise ValueError("--output must not be a RAW photo file")
+    if output_path.exists() and not output_path.is_file():
+        raise ValueError("--output must be a file path")
+
     if exiftool_lookup("exiftool") is None:
         raise RuntimeError("exiftool was not found on PATH")
 
@@ -317,6 +356,12 @@ def validate_startup(
         ollama_ready = ensure_ollama_ready
 
     ollama_ready(model)
+
+    try:
+        with output_path.open("a", encoding="utf-8"):
+            pass
+    except OSError as exc:
+        raise ValueError(f"--output is not writable: {exc}") from exc
 
 
 def ensure_ollama_ready(model: str, client: Any | None = None) -> None:

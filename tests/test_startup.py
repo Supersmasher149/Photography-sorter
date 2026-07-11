@@ -79,3 +79,40 @@ class StartupValidationTests(unittest.TestCase):
                 )
 
             self.assertIn("missing-model", str(exc.exception))
+
+    def test_validate_startup_rejects_raw_output_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            input_dir = Path(tmp)
+            output_path = input_dir / "IMG_0001.CR3"
+            output_path.write_bytes(b"raw-data")
+
+            with self.assertRaises(ValueError) as exc:
+                validate_startup(
+                    input_dir=input_dir,
+                    output_path=output_path,
+                    model="test-model",
+                    max_size=100,
+                    exiftool_lookup=lambda _name: "exiftool",
+                    ollama_ready=lambda _model: None,
+                )
+
+            self.assertIn("RAW", str(exc.exception))
+            self.assertEqual(output_path.read_bytes(), b"raw-data")
+
+    def test_validate_startup_rejects_output_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            input_dir = Path(tmp)
+            output_path = input_dir / "ratings.jsonl"
+            output_path.mkdir()
+
+            with self.assertRaises(ValueError) as exc:
+                validate_startup(
+                    input_dir=input_dir,
+                    output_path=output_path,
+                    model="test-model",
+                    max_size=100,
+                    exiftool_lookup=lambda _name: "exiftool",
+                    ollama_ready=lambda _model: None,
+                )
+
+            self.assertIn("file path", str(exc.exception))
