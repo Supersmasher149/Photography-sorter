@@ -62,6 +62,28 @@ class CoreJsonlTests(unittest.TestCase):
             self.assertIn("line 1", str(exc.exception))
             self.assertIn("expected object", str(exc.exception))
 
+    def test_load_completed_paths_reports_invalid_json_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_path = Path(tmp) / "ratings.jsonl"
+            output_path.write_text(
+                '{"raw_path": "/first.CR3"}\nnot-json\n', encoding="utf-8"
+            )
+
+            with self.assertRaises(ValueError) as exc:
+                load_completed_paths(output_path)
+
+            self.assertIn("line 2", str(exc.exception))
+
+    def test_load_completed_paths_rejects_missing_raw_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_path = Path(tmp) / "ratings.jsonl"
+            output_path.write_text('{"error": null}\n', encoding="utf-8")
+
+            with self.assertRaises(ValueError) as exc:
+                load_completed_paths(output_path)
+
+            self.assertIn("missing raw_path", str(exc.exception))
+
     def test_parse_model_json_validates_required_fields(self):
         parsed = parse_model_json(
             '{"rating": 4, "keep": true, "reason": "Strong composition."}'

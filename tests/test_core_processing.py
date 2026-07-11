@@ -49,9 +49,25 @@ class CoreProcessingTests(unittest.TestCase):
             tmp_path = Path(tmp)
             raw_path = tmp_path / "photo.CR3"
             raw_path.write_text("", encoding="utf-8")
-            (tmp_path / "alias.CR3").symlink_to(raw_path)
+            try:
+                (tmp_path / "alias.CR3").symlink_to(raw_path)
+            except OSError as exc:
+                self.skipTest(f"Symlinks are unavailable: {exc}")
 
             self.assertEqual(find_raw_files(tmp_path), [raw_path.resolve()])
+
+    def test_find_raw_files_recurses_only_when_requested(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            nested = tmp_path / "nested"
+            nested.mkdir()
+            nested_raw = nested / "photo.NEF"
+            nested_raw.write_text("", encoding="utf-8")
+
+            self.assertEqual(find_raw_files(tmp_path, recursive=False), [])
+            self.assertEqual(
+                find_raw_files(tmp_path, recursive=True), [nested_raw.resolve()]
+            )
 
     def test_process_file_records_raw_response_for_invalid_model_json(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -120,6 +136,25 @@ class CoreProcessingTests(unittest.TestCase):
             finally:
                 preview_path.unlink(missing_ok=True)
 
+    def test_extract_embedded_jpeg_removes_temp_file_after_timeout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            raw_path = tmp_path / "IMG_0001.CR3"
+            raw_path.write_text("", encoding="utf-8")
+            real_mkstemp = tempfile.mkstemp
+
+            def fake_mkstemp(*_args, **_kwargs):
+                return real_mkstemp(dir=tmp_path, prefix="preview-", suffix=".jpg")
+
+            def timeout(_args, **_kwargs):
+                raise subprocess.TimeoutExpired("exiftool", 60)
+
+            with mock.patch("photo_cull_ai.core.tempfile.mkstemp", side_effect=fake_mkstemp):
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    extract_embedded_jpeg(raw_path, run_command=timeout)
+
+            self.assertEqual(list(tmp_path.glob("preview-*.jpg")), [])
+
     def test_resize_removes_output_temp_file_when_pillow_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -135,6 +170,23 @@ class CoreProcessingTests(unittest.TestCase):
                     resize_to_temp_jpeg(preview_path, 100)
 
             self.assertEqual(list(tmp_path.glob("resized-*.jpg")), [])
+
+    def test_resize_creates_bounded_rgb_jpeg(self):
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            preview_path = tmp_path / "preview.png"
+            Image.new("RGBA", (400, 200), (255, 0, 0, 128)).save(preview_path)
+
+            output_path = resize_to_temp_jpeg(preview_path, 100)
+            try:
+                with Image.open(output_path) as resized:
+                    self.assertEqual(resized.size, (100, 50))
+                    self.assertEqual(resized.mode, "RGB")
+                    self.assertEqual(resized.format, "JPEG")
+            finally:
+                output_path.unlink(missing_ok=True)
 
     def test_cleanup_failure_is_recorded_without_escaping(self):
         class LockedTempPath:
@@ -162,6 +214,30 @@ class CoreProcessingTests(unittest.TestCase):
 
             self.assertIn("Failed to remove temporary file", record["error"])
             self.assertEqual(json.loads(output_path.read_text(encoding="utf-8")), record)
+
+    def test_cleanup_failure_preserves_original_processing_error(self):
+        class LockedTempPath:
+            def unlink(self, missing_ok=False):
+                raise PermissionError("locked")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            raw_path = tmp_path / "IMG_0001.CR3"
+            raw_path.write_text("", encoding="utf-8")
+
+            record = process_raw_file(
+                raw_path=raw_path,
+                output_path=tmp_path / "ratings.jsonl",
+                model="test-model",
+                max_size=100,
+                extract_preview=lambda _path: LockedTempPath(),
+                resize_preview=lambda _path, _size: (_ for _ in ()).throw(
+                    ValueError("decode failed")
+                ),
+            )
+
+            self.assertIn("decode failed", record["error"])
+            self.assertIn("Failed to remove temporary file", record["error"])
 
     def test_run_batch_skips_completed_paths_when_resume_enabled(self):
         with tempfile.TemporaryDirectory() as tmp:
